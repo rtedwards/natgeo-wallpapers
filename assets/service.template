@@ -1,0 +1,8 @@
+[Unit]
+Description=Download and set National Geographic Photo of the Day as wallpaper
+After=network-online.target network.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'for i in 1 2 3; do {{BINARY}} download && {{BINARY}} set && exit 0 || sleep 60; done; exit 1'

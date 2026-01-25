@@ -1,9 +1,12 @@
 use chrono::Local;
+use owo_colors::OwoColorize;
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, ACCEPT_LANGUAGE, USER_AGENT};
 use std::{
     fs::{File, OpenOptions},
     io::{self, Write},
+    path::PathBuf,
+    process::Command,
 };
 use thiserror::Error;
 
@@ -12,6 +15,7 @@ use thiserror::Error;
 // that scrapes the photo of the day page directly
 pub const NATGEO_POD_URL: &str = "https://www.nationalgeographic.com/photo-of-the-day";
 pub const PHOTO_SAVE_PATH: &str = "~/Pictures/NationalGeographic/"; // Photos saved here
+pub const LOG_DIR: &str = "~/.local/share/natgeo-wallpapers/";
 
 // Since the JSON API is now protected, we'll need to scrape the HTML page
 // For now, let's create a simple structure to hold photo information
@@ -35,6 +39,45 @@ pub enum PhotoError {
 
     #[error("Invalid content type: {0}")]
     InvalidContentType(String),
+
+    #[error("Wallpaper error: {0}")]
+    Wallpaper(String),
+
+    #[error("Command execution error: {0}")]
+    Command(String),
+
+    #[error("No photos found: {0}")]
+    NoPhotos(String),
+}
+
+// Wallpaper mode for multi-monitor/virtual desktop support
+#[derive(Debug, Clone, Copy, Default)]
+pub enum WallpaperMode {
+    #[default]
+    Monitors,
+    VirtualDesktops,
+    Both,
+}
+
+impl std::fmt::Display for WallpaperMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Monitors => write!(f, "monitors"),
+            Self::VirtualDesktops => write!(f, "virtual-desktops"),
+            Self::Both => write!(f, "both"),
+        }
+    }
+}
+
+// Detected desktop environment
+#[derive(Debug, Clone, Copy)]
+pub enum DesktopEnvironment {
+    KdePlasma6,
+    KdePlasma5,
+    PlasmaFallback,
+    Gnome,
+    Feh,
+    Unknown,
 }
 
 // Function to get the file extension based on the MIME type
@@ -233,6 +276,609 @@ pub fn expand_tilde(path: &str) -> String {
         }
     }
     path.to_string()
+}
+
+// ============================================================================
+// Wallpaper Setting Functions
+// ============================================================================
+
+/// Check if a command exists in PATH
+fn command_exists(cmd: &str) -> bool {
+    Command::new("which")
+        .arg(cmd)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Check if a process is running
+fn process_running(name: &str) -> bool {
+    Command::new("pgrep")
+        .args(["-x", name])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Detect the current desktop environment
+pub fn detect_desktop_environment() -> DesktopEnvironment {
+    let plasmashell_running = process_running("plasmashell");
+
+    if command_exists("qdbus6") && plasmashell_running {
+        DesktopEnvironment::KdePlasma6
+    } else if command_exists("qdbus") && plasmashell_running {
+        DesktopEnvironment::KdePlasma5
+    } else if command_exists("plasma-apply-wallpaperimage") {
+        DesktopEnvironment::PlasmaFallback
+    } else if command_exists("gsettings") {
+        DesktopEnvironment::Gnome
+    } else if command_exists("feh") {
+        DesktopEnvironment::Feh
+    } else {
+        DesktopEnvironment::Unknown
+    }
+}
+
+/// Get monitor count via qdbus
+fn get_monitor_count(de: DesktopEnvironment) -> usize {
+    let qdbus_cmd = match de {
+        DesktopEnvironment::KdePlasma6 => "qdbus6",
+        DesktopEnvironment::KdePlasma5 => "qdbus",
+        _ => return 1,
+    };
+
+    let script = "var allDesktops = desktops(); print(allDesktops.length);";
+    let output = Command::new(qdbus_cmd)
+        .args([
+            "org.kde.plasmashell",
+            "/PlasmaShell",
+            "org.kde.PlasmaShell.evaluateScript",
+            script,
+        ])
+        .output();
+
+    output
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(1)
+}
+
+/// Get virtual desktop count via qdbus
+fn get_virtual_desktop_count(de: DesktopEnvironment) -> usize {
+    let qdbus_cmd = match de {
+        DesktopEnvironment::KdePlasma6 => "qdbus6",
+        _ => return 1, // Only Plasma 6 supports VD wallpapers reliably
+    };
+
+    let output = Command::new(qdbus_cmd)
+        .args([
+            "org.kde.KWin",
+            "/VirtualDesktopManager",
+            "org.kde.KWin.VirtualDesktopManager.count",
+        ])
+        .output();
+
+    output
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(1)
+}
+
+/// Recursively collect photos from a directory
+fn collect_photos(dir: &std::path::Path, photos: &mut Vec<PathBuf>) -> io::Result<()> {
+    if dir.is_dir() {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                collect_photos(&path, photos)?;
+            } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                if matches!(ext.to_lowercase().as_str(), "jpg" | "jpeg" | "png" | "gif") {
+                    photos.push(path);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Find all photos in the photo directory, sorted newest first
+pub fn find_all_photos() -> Result<Vec<PathBuf>, PhotoError> {
+    let photo_dir = expand_tilde(PHOTO_SAVE_PATH);
+    let photo_path = std::path::Path::new(&photo_dir);
+
+    if !photo_path.exists() {
+        return Err(PhotoError::NoPhotos(format!(
+            "Photo directory not found: {}",
+            photo_dir
+        )));
+    }
+
+    let mut photos: Vec<PathBuf> = Vec::new();
+    collect_photos(photo_path, &mut photos)?;
+
+    if photos.is_empty() {
+        return Err(PhotoError::NoPhotos(format!(
+            "No photos found in {}",
+            photo_dir
+        )));
+    }
+
+    // Sort by path (which includes date directories) in reverse order (newest first)
+    photos.sort();
+    photos.reverse();
+
+    Ok(photos)
+}
+
+/// Wallpaper assignment for display
+#[derive(Debug)]
+pub struct WallpaperAssignment {
+    pub location: String,
+    pub photo_path: PathBuf,
+    pub is_newest: bool,
+}
+
+/// Build wallpaper assignments based on mode
+pub fn build_assignments(
+    mode: WallpaperMode,
+    photos: &[PathBuf],
+    monitor_count: usize,
+    vd_count: usize,
+) -> Vec<WallpaperAssignment> {
+    let mut assignments = Vec::new();
+
+    match mode {
+        WallpaperMode::Monitors => {
+            for i in 0..monitor_count {
+                let photo_idx = i % photos.len();
+                assignments.push(WallpaperAssignment {
+                    location: format!("Monitor {}", i + 1),
+                    photo_path: photos[photo_idx].clone(),
+                    is_newest: i == 0,
+                });
+            }
+        }
+        WallpaperMode::VirtualDesktops => {
+            for i in 0..vd_count {
+                let photo_idx = i % photos.len();
+                assignments.push(WallpaperAssignment {
+                    location: format!("Virtual Desktop {}", i + 1),
+                    photo_path: photos[photo_idx].clone(),
+                    is_newest: i == 0,
+                });
+            }
+        }
+        WallpaperMode::Both => {
+            let mut idx = 0;
+            for vd in 0..vd_count {
+                for mon in 0..monitor_count {
+                    let photo_idx = idx % photos.len();
+                    assignments.push(WallpaperAssignment {
+                        location: format!("Monitor {}, VD {}", mon + 1, vd + 1),
+                        photo_path: photos[photo_idx].clone(),
+                        is_newest: idx == 0,
+                    });
+                    idx += 1;
+                }
+            }
+        }
+    }
+
+    assignments
+}
+
+/// Set wallpaper for a specific monitor using qdbus6
+fn set_wallpaper_qdbus6(
+    monitor_idx: usize,
+    photo_path: &std::path::Path,
+) -> Result<(), PhotoError> {
+    let path_str = photo_path.to_string_lossy();
+    let script = format!(
+        r"var allDesktops = desktops();
+if ({idx} < allDesktops.length) {{
+    d = allDesktops[{idx}];
+    d.wallpaperPlugin = 'org.kde.image';
+    d.currentConfigGroup = Array('Wallpaper', 'org.kde.image', 'General');
+    d.writeConfig('Image', 'file://{path}');
+}}",
+        idx = monitor_idx,
+        path = path_str
+    );
+
+    let output = Command::new("qdbus6")
+        .args([
+            "org.kde.plasmashell",
+            "/PlasmaShell",
+            "org.kde.PlasmaShell.evaluateScript",
+            &script,
+        ])
+        .output()
+        .map_err(|e| PhotoError::Command(e.to_string()))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(PhotoError::Wallpaper(
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        ))
+    }
+}
+
+/// Set wallpaper for a specific monitor using qdbus (Plasma 5)
+fn set_wallpaper_qdbus(monitor_idx: usize, photo_path: &std::path::Path) -> Result<(), PhotoError> {
+    let path_str = photo_path.to_string_lossy();
+    let script = format!(
+        r"var allDesktops = desktops();
+if ({idx} < allDesktops.length) {{
+    d = allDesktops[{idx}];
+    d.wallpaperPlugin = 'org.kde.image';
+    d.currentConfigGroup = Array('Wallpaper', 'org.kde.image', 'General');
+    d.writeConfig('Image', 'file://{path}');
+}}",
+        idx = monitor_idx,
+        path = path_str
+    );
+
+    let output = Command::new("qdbus")
+        .args([
+            "org.kde.plasmashell",
+            "/PlasmaShell",
+            "org.kde.PlasmaShell.evaluateScript",
+            &script,
+        ])
+        .output()
+        .map_err(|e| PhotoError::Command(e.to_string()))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(PhotoError::Wallpaper(
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        ))
+    }
+}
+
+/// Set wallpaper using plasma-apply-wallpaperimage
+fn set_wallpaper_plasma_apply(photo_path: &std::path::Path) -> Result<(), PhotoError> {
+    let output = Command::new("plasma-apply-wallpaperimage")
+        .arg(photo_path)
+        .output()
+        .map_err(|e| PhotoError::Command(e.to_string()))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(PhotoError::Wallpaper(
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        ))
+    }
+}
+
+/// Set wallpaper using gsettings (GNOME)
+fn set_wallpaper_gnome(photo_path: &std::path::Path) -> Result<(), PhotoError> {
+    let uri = format!("file://{}", photo_path.to_string_lossy());
+
+    // Set both light and dark mode wallpapers
+    for key in ["picture-uri", "picture-uri-dark"] {
+        let output = Command::new("gsettings")
+            .args(["set", "org.gnome.desktop.background", key, &uri])
+            .output()
+            .map_err(|e| PhotoError::Command(e.to_string()))?;
+
+        if !output.status.success() {
+            return Err(PhotoError::Wallpaper(
+                String::from_utf8_lossy(&output.stderr).to_string(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Set wallpaper using feh (X11)
+fn set_wallpaper_feh(photo_path: &std::path::Path) -> Result<(), PhotoError> {
+    let output = Command::new("feh")
+        .args(["--bg-scale", &photo_path.to_string_lossy()])
+        .output()
+        .map_err(|e| PhotoError::Command(e.to_string()))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(PhotoError::Wallpaper(
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        ))
+    }
+}
+
+/// Main wallpaper setting function
+#[allow(clippy::too_many_lines)]
+pub fn set_wallpapers(mode: WallpaperMode) -> Result<(), PhotoError> {
+    let log_path = format!("{}wallpaper.log", expand_tilde(LOG_DIR));
+
+    // Ensure log directory exists
+    if let Some(parent) = std::path::Path::new(&log_path).parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    println!("{}", "=== National Geographic Wallpaper ===".green());
+    println!("Mode: {}\n", mode.to_string().yellow());
+
+    write_log(
+        &log_path,
+        &format!("Starting wallpaper set with mode: {}", mode),
+    );
+
+    // Find all photos
+    let photos = find_all_photos()?;
+    println!("{} Found {} photo(s)\n", "✓".green(), photos.len());
+
+    // Detect desktop environment
+    let de = detect_desktop_environment();
+    let monitor_count = get_monitor_count(de);
+    let vd_count = get_virtual_desktop_count(de);
+
+    match de {
+        DesktopEnvironment::KdePlasma6 => {
+            println!(
+                "{} Detected KDE Plasma 6: {} monitor(s), {} virtual desktop(s)",
+                "✓".green(),
+                monitor_count,
+                vd_count
+            );
+        }
+        DesktopEnvironment::KdePlasma5 => {
+            println!(
+                "{} Detected KDE Plasma 5: {} monitor(s)",
+                "✓".green(),
+                monitor_count
+            );
+            if matches!(mode, WallpaperMode::VirtualDesktops | WallpaperMode::Both) {
+                println!(
+                    "{} Virtual desktop mode requires Plasma 6+, falling back to monitors",
+                    "!".yellow()
+                );
+            }
+        }
+        DesktopEnvironment::PlasmaFallback => {
+            println!(
+                "{} Using plasma-apply-wallpaperimage (single wallpaper mode)",
+                "!".yellow()
+            );
+        }
+        DesktopEnvironment::Gnome => {
+            println!("{} Detected GNOME, using gsettings", "✓".green());
+        }
+        DesktopEnvironment::Feh => {
+            println!("{} Using feh for X11", "✓".green());
+        }
+        DesktopEnvironment::Unknown => {
+            return Err(PhotoError::Wallpaper(
+                "No supported wallpaper tool found".to_string(),
+            ));
+        }
+    }
+    println!();
+
+    // Determine effective mode based on DE capabilities
+    let effective_mode = match de {
+        DesktopEnvironment::KdePlasma6 => mode,
+        _ => WallpaperMode::Monitors, // Single wallpaper or monitor-only for non-Plasma6
+    };
+
+    // Build assignments
+    let assignments = build_assignments(effective_mode, &photos, monitor_count, vd_count);
+
+    // Calculate needed wallpapers
+    let total_needed = assignments.len();
+    println!("Wallpapers needed: {}", total_needed);
+
+    if photos.len() < total_needed {
+        println!(
+            "{} Only {} photos available, will reuse as needed\n",
+            "!".yellow(),
+            photos.len()
+        );
+    }
+    println!();
+
+    // Display assignments
+    println!("{}", "Wallpaper assignments:".yellow());
+    for assignment in &assignments {
+        let photo_date = assignment
+            .photo_path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown");
+        let photo_name = assignment
+            .photo_path
+            .file_stem()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown");
+
+        if assignment.is_newest {
+            println!(
+                "  {}: {} - {} {}",
+                assignment.location,
+                photo_date.green(),
+                photo_name,
+                "(newest)".yellow()
+            );
+        } else {
+            println!(
+                "  {}: {} - {}",
+                assignment.location,
+                photo_date.green(),
+                photo_name
+            );
+        }
+    }
+    println!();
+
+    // Apply wallpapers
+    println!("{}", "Applying wallpapers...".yellow());
+    println!();
+
+    match de {
+        DesktopEnvironment::KdePlasma6 => {
+            apply_kde_plasma6_wallpapers(&assignments, effective_mode, monitor_count, &log_path);
+        }
+        DesktopEnvironment::KdePlasma5 => {
+            apply_kde_plasma5_wallpapers(&assignments, &log_path);
+        }
+        DesktopEnvironment::PlasmaFallback => {
+            if let Some(first) = assignments.first() {
+                match set_wallpaper_plasma_apply(&first.photo_path) {
+                    Ok(()) => {
+                        println!("{} Wallpaper set", "✓".green());
+                        write_log(
+                            &log_path,
+                            &format!("Set wallpaper to: {}", first.photo_path.display()),
+                        );
+                    }
+                    Err(e) => {
+                        println!("{} Failed to set wallpaper: {}", "✗".red(), e);
+                    }
+                }
+            }
+        }
+        DesktopEnvironment::Gnome => {
+            if let Some(first) = assignments.first() {
+                match set_wallpaper_gnome(&first.photo_path) {
+                    Ok(()) => {
+                        println!("{} Wallpaper set via gsettings", "✓".green());
+                        write_log(
+                            &log_path,
+                            &format!("Set wallpaper to: {}", first.photo_path.display()),
+                        );
+                    }
+                    Err(e) => {
+                        println!("{} Failed to set wallpaper: {}", "✗".red(), e);
+                    }
+                }
+            }
+        }
+        DesktopEnvironment::Feh => {
+            if let Some(first) = assignments.first() {
+                match set_wallpaper_feh(&first.photo_path) {
+                    Ok(()) => {
+                        println!("{} Wallpaper set via feh", "✓".green());
+                        write_log(
+                            &log_path,
+                            &format!("Set wallpaper to: {}", first.photo_path.display()),
+                        );
+                    }
+                    Err(e) => {
+                        println!("{} Failed to set wallpaper: {}", "✗".red(), e);
+                    }
+                }
+            }
+        }
+        DesktopEnvironment::Unknown => unreachable!(),
+    }
+
+    println!();
+    println!("{}", "=== Completed ===".green());
+    write_log(&log_path, "Wallpaper setting completed");
+
+    println!("\nLog file: {}", log_path);
+
+    Ok(())
+}
+
+/// Apply wallpapers for KDE Plasma 6
+fn apply_kde_plasma6_wallpapers(
+    assignments: &[WallpaperAssignment],
+    mode: WallpaperMode,
+    monitor_count: usize,
+    log_path: &str,
+) {
+    match mode {
+        WallpaperMode::Monitors => {
+            for (i, assignment) in assignments.iter().enumerate() {
+                match set_wallpaper_qdbus6(i, &assignment.photo_path) {
+                    Ok(()) => {
+                        println!("{} {}", "✓".green(), assignment.location);
+                        write_log(
+                            log_path,
+                            &format!(
+                                "Set {} to: {}",
+                                assignment.location,
+                                assignment.photo_path.display()
+                            ),
+                        );
+                    }
+                    Err(e) => {
+                        println!("{} Failed: {} - {}", "✗".red(), assignment.location, e);
+                    }
+                }
+            }
+        }
+        WallpaperMode::VirtualDesktops => {
+            for assignment in assignments {
+                // Set same wallpaper on all monitors for this VD
+                for mon in 0..monitor_count {
+                    let _ = set_wallpaper_qdbus6(mon, &assignment.photo_path);
+                }
+                println!("{} {} (all monitors)", "✓".green(), assignment.location);
+                write_log(
+                    log_path,
+                    &format!(
+                        "Set {} to: {}",
+                        assignment.location,
+                        assignment.photo_path.display()
+                    ),
+                );
+            }
+        }
+        WallpaperMode::Both => {
+            for (i, assignment) in assignments.iter().enumerate() {
+                let mon_idx = i % monitor_count;
+                match set_wallpaper_qdbus6(mon_idx, &assignment.photo_path) {
+                    Ok(()) => {
+                        println!("{} {}", "✓".green(), assignment.location);
+                        write_log(
+                            log_path,
+                            &format!(
+                                "Set {} to: {}",
+                                assignment.location,
+                                assignment.photo_path.display()
+                            ),
+                        );
+                    }
+                    Err(e) => {
+                        println!("{} Failed: {} - {}", "✗".red(), assignment.location, e);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Apply wallpapers for KDE Plasma 5
+fn apply_kde_plasma5_wallpapers(assignments: &[WallpaperAssignment], log_path: &str) {
+    for (i, assignment) in assignments.iter().enumerate() {
+        match set_wallpaper_qdbus(i, &assignment.photo_path) {
+            Ok(()) => {
+                println!("{} {}", "✓".green(), assignment.location);
+                write_log(
+                    log_path,
+                    &format!(
+                        "Set {} to: {}",
+                        assignment.location,
+                        assignment.photo_path.display()
+                    ),
+                );
+            }
+            Err(e) => {
+                println!("{} Failed: {} - {}", "✗".red(), assignment.location, e);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
