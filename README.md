@@ -118,6 +118,12 @@ The installer creates two files:
 - `~/.config/systemd/user/natgeo-wallpaper.service`
 - `~/.config/systemd/user/natgeo-wallpaper.timer`
 
+**When it runs:**
+- Daily at configured time (default: 2:00 AM)
+- 2 minutes after boot (catches missed runs if computer was off)
+- Retries up to 3 times with 60s delays if network fails
+- Persistent: will catch up missed scheduled runs
+
 **Check timer status:**
 ```bash
 systemctl --user status natgeo-wallpaper.timer
@@ -126,6 +132,12 @@ systemctl --user status natgeo-wallpaper.timer
 **View logs:**
 ```bash
 journalctl --user -u natgeo-wallpaper.service
+
+# View recent runs
+journalctl --user -u natgeo-wallpaper.service --since today
+
+# Follow logs in real-time
+journalctl --user -u natgeo-wallpaper.service -f
 ```
 
 **Manually trigger:**
@@ -151,22 +163,53 @@ systemctl --user daemon-reload
 systemctl --user restart natgeo-wallpaper.timer
 ```
 
-## Setting Wallpaper Automatically
+## Setting Wallpaper
 
-The `set_wallpaper.sh` script downloads the photo using the Rust binary and sets it as your desktop wallpaper.
+The `set_wallpaper.sh` script downloads today's photo and sets wallpapers with multi-monitor support.
 
 ### Usage
 
 ```bash
+# Default: different wallpaper per monitor
 ./set_wallpaper.sh
+
+# Different wallpaper per monitor (explicit)
+./set_wallpaper.sh monitors
+
+# Different wallpaper per virtual desktop
+./set_wallpaper.sh virtual-desktops
+
+# Different wallpaper per monitor × virtual desktop
+./set_wallpaper.sh both
 ```
 
 ### Supported Desktop Environments
 
-- **KDE Plasma 6** - Uses `plasma-apply-wallpaperimage` (preferred) or `qdbus6`
-- **KDE Plasma 5** - Uses `qdbus`
+- **KDE Plasma 6** - Uses `qdbus6` for full multi-monitor/VD support, or `plasma-apply-wallpaperimage` fallback
+- **KDE Plasma 5** - Uses `qdbus` (monitor mode only)
 - **GNOME/Ubuntu** - Uses `gsettings` 
 - **Generic X11** - Uses `feh`
+
+### Multi-Monitor/Virtual Desktop Modes
+
+**How it works:**
+- Downloads today's photo, then uses existing photos (newest first)
+- Monitor 1 = today's photo, Monitor 2/VD 2/etc = previous photos
+- Automatically detects your setup (monitors + virtual desktops)
+- Reuses photos if you don't have enough
+
+**Examples:**
+
+If you have 2 monitors and 2 virtual desktops:
+- `monitors` mode: 2 different photos (one per monitor)
+- `virtual-desktops` mode: 2 different photos (one per VD, same across both monitors)
+- `both` mode: 4 different photos (unique per monitor × VD combination)
+
+**Building photo collection:**
+```bash
+# Run daily to collect more photos, then set wallpapers
+./set_wallpaper.sh both
+```
 
 ### Logs
 
