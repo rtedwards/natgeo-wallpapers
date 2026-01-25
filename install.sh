@@ -161,12 +161,13 @@ else
         cat > "$HOME/.config/systemd/user/natgeo-wallpaper.service" << EOF
 [Unit]
 Description=Download and set National Geographic Photo of the Day as wallpaper
-After=network-online.target
+After=network-online.target network.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=$WALLPAPER_CMD
+# Wait for network and retry on failure
+ExecStart=/bin/sh -c 'for i in 1 2 3; do $WALLPAPER_CMD && exit 0 || sleep 60; done; exit 1'
 EOF
 
         # Create systemd timer
@@ -176,6 +177,7 @@ Description=Daily National Geographic Photo of the Day wallpaper update
 
 [Timer]
 OnCalendar=*-*-* $SYSTEMD_TIME:00
+OnBootSec=2min
 Persistent=true
 
 [Install]

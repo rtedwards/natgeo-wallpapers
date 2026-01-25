@@ -118,6 +118,12 @@ The installer creates two files:
 - `~/.config/systemd/user/natgeo-wallpaper.service`
 - `~/.config/systemd/user/natgeo-wallpaper.timer`
 
+**When it runs:**
+- Daily at configured time (default: 2:00 AM)
+- 5 minutes after boot (catches missed runs if computer was off)
+- Retries up to 3 times with 60s delays if network fails
+- Persistent: will catch up missed scheduled runs
+
 **Check timer status:**
 ```bash
 systemctl --user status natgeo-wallpaper.timer
@@ -126,6 +132,12 @@ systemctl --user status natgeo-wallpaper.timer
 **View logs:**
 ```bash
 journalctl --user -u natgeo-wallpaper.service
+
+# View recent runs
+journalctl --user -u natgeo-wallpaper.service --since today
+
+# Follow logs in real-time
+journalctl --user -u natgeo-wallpaper.service -f
 ```
 
 **Manually trigger:**
