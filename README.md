@@ -1,29 +1,30 @@
 # National Geographic Photo of the Day Downloader
 
-A Rust-based tool that downloads the National Geographic Photo of the Day and saves it to a dated directory.
+A Rust-based tool that downloads the National Geographic Photo of the Day and sets it as your wallpaper, with support for multi-monitor setups and wallpaper rotation.
 
 ## Features
 
 - Downloads the current National Geographic Photo of the Day
-- Automatically detects image format (jpg, png, gif)
+- Downloads entire monthly "Best of Photo of the Day" collections
+- Sets wallpapers with multi-monitor and virtual desktop support
+- Random wallpaper rotation from your photo collection
+- Automatic scheduling with systemd timers (daily or interval-based)
 - Organizes photos by date in `dd-mm-YYYY` format
-- Mimics browser headers to bypass CloudFront protection
-- Simple and lightweight
+- Supports KDE Plasma 6/5, GNOME, and X11 (feh)
 
 ## Prerequisites
 
 - Rust and Cargo (install from [rustup.rs](https://rustup.rs/))
+- Linux with systemd (for automatic scheduling)
 
 ## Installation
 
 ### Quick Install (Recommended)
 
-Run the install script to automatically set everything up:
-
 ```bash
 git clone https://github.com/yourusername/natgeo-wallpapers.git
 cd natgeo-wallpapers
-make install
+./install.sh
 ```
 
 The install script will:
@@ -31,327 +32,255 @@ The install script will:
 - Install to `~/.local/bin/natgeo-wallpapers`
 - Create photo directory at `~/Pictures/NationalGeographic/`
 - Set up wallpaper picker integration for KDE
-- Install `natgeo-set-wallpaper` command
-- Optionally configure cron job (default: daily at 2:00 AM)
 
-### Manual Installation
+### Manual Build
 
-1. Clone this repository:
 ```bash
-git clone https://github.com/yourusername/natgeo-wallpapers.git
-cd natgeo-wallpapers
-```
-
-2. Build and install:
-```bash
-make install
+cargo build --release
+./target/release/natgeo-wallpapers --help
 ```
 
 ## Usage
 
-### Basic Usage
-
-Run the program to download today's photo:
+### Commands Overview
 
 ```bash
-natgeo-wallpapers
+natgeo-wallpapers                    # Download today's photo (default)
+natgeo-wallpapers download           # Download today's photo
+natgeo-wallpapers set [OPTIONS]      # Set wallpaper from downloaded photos
+natgeo-wallpapers download-collection --url <URL>  # Download a monthly collection
+natgeo-wallpapers install [OPTIONS]  # Set up automatic scheduling
 ```
 
-Or during development:
+### Download Today's Photo
 
 ```bash
-cargo run
+natgeo-wallpapers download
 ```
 
-### Logging
+### Download Monthly Collections
 
-The script automatically creates a log file (`<photo-title>.log`) in the same directory as each downloaded photo. The log includes:
+Download entire "Best of Photo of the Day" collections:
 
-- Download start time
-- Image URL
-- Success/failure status
-- Error details (if any)
-- Completion timestamp
-
-Example log file location: `./natgeo-photos/20-01-2026/NationalGeographic_433254.log`
-
-### Configuration
-
-By default, photos are saved to `~/Pictures/NationalGeographic/<dd-mm-YYYY>/`. To change the save location, edit the `PHOTO_SAVE_PATH` constant in `src/lib.rs`:
-
-```rust
-const PHOTO_SAVE_PATH: &str = "~/Pictures/NationalGeographic/"; // Change this to your preferred path
-```
-
-Then rebuild and reinstall:
 ```bash
-make install
+natgeo-wallpapers download-collection --url "https://www.nationalgeographic.com/photography/article/best-photos-october-2018"
 ```
 
-### Wallpaper Picker Integration
+Collections are saved to `~/Pictures/NationalGeographic/collections/<collection-name>/`
 
-The install script creates a symlink at `~/.local/share/wallpapers/NationalGeographic/` that points to your photo directory. This makes downloaded photos appear in KDE Plasma's wallpaper picker under "National Geographic Photo of the Day".
-```
+Browse available collections at: https://www.nationalgeographic.com/photography/topic/best-of-photo-of-the-day
 
-## Output Structure
+### Set Wallpaper
 
-Photos are organized as follows:
-
-```
-~/Pictures/NationalGeographic/
-├── 20-01-2026/
-│   ├── NationalGeographic_433254.jpg
-│   └── NationalGeographic_433254.log
-├── 21-01-2026/
-│   ├── NationalGeographic_789012.jpg
-│   └── NationalGeographic_789012.log
-└── ...
-```
-
-## Automation
-
-The install script sets up a systemd timer by default. 
-
-### Systemd Timer
-
-The installer creates two files:
-- `~/.config/systemd/user/natgeo-wallpaper.service`
-- `~/.config/systemd/user/natgeo-wallpaper.timer`
-
-**When it runs:**
-- Daily at configured time (default: 2:00 AM)
-- 2 minutes after boot (catches missed runs if computer was off)
-- Retries up to 3 times with 60s delays if network fails
-- Persistent: will catch up missed scheduled runs
-
-**Check timer status:**
 ```bash
+# Set wallpaper from default directory (newest photos first)
+natgeo-wallpapers set
+
+# Set wallpaper from a specific directory
+natgeo-wallpapers set --path ~/Pictures/NationalGeographic/collections
+
+# Set a random wallpaper
+natgeo-wallpapers set --random
+
+# Set random wallpaper from a specific collection
+natgeo-wallpapers set --random --path ~/Pictures/NationalGeographic/collections/best-photos-october-2018
+
+# Also set lock screen (KDE Plasma only)
+natgeo-wallpapers set --lock-screen
+```
+
+#### Multi-Monitor Modes
+
+```bash
+# Different wallpaper per monitor (default)
+natgeo-wallpapers set --mode monitors
+
+# Different wallpaper per virtual desktop
+natgeo-wallpapers set --mode virtual-desktops
+
+# Different wallpaper per monitor × virtual desktop
+natgeo-wallpapers set --mode both
+```
+
+### Automatic Scheduling
+
+Set up a systemd timer to automatically update wallpapers:
+
+```bash
+# Interactive setup (prompts for schedule)
+natgeo-wallpapers install
+
+# Daily at 2:00 AM (download new photo)
+natgeo-wallpapers install --time 02:00
+
+# Hourly random rotation from collections
+natgeo-wallpapers install --time 1h --random --path ~/Pictures/NationalGeographic/collections
+
+# Every 30 minutes
+natgeo-wallpapers install --time 30m --random
+
+# Uninstall the timer
+natgeo-wallpapers install --uninstall
+```
+
+#### Schedule Options
+
+When running `install` interactively, you'll see:
+
+```
+When would you like the wallpaper to update?
+  1) Daily at 02:00 (recommended for daily photo)
+  2) Every hour (good for random rotation)
+  3) Every 30 minutes
+  4) Custom time (HH:MM)
+  5) Custom interval (e.g., 2h, 15m)
+  6) Cancel
+```
+
+**Note:** Running `install` again will replace the previous timer configuration. You can only have one active timer at a time.
+
+#### Timer Management
+
+```bash
+# Check timer status
 systemctl --user status natgeo-wallpaper.timer
-```
 
-**View logs:**
-```bash
+# View logs
 journalctl --user -u natgeo-wallpaper.service
 
-# View recent runs
-journalctl --user -u natgeo-wallpaper.service --since today
-
-# Follow logs in real-time
-journalctl --user -u natgeo-wallpaper.service -f
-```
-
-**Manually trigger:**
-```bash
+# Manually trigger
 systemctl --user start natgeo-wallpaper.service
-```
 
-**Disable timer:**
-```bash
+# Disable timer
 systemctl --user disable natgeo-wallpaper.timer
 systemctl --user stop natgeo-wallpaper.timer
 ```
 
-**Change schedule:**
-Edit the timer file:
-```bash
-nano ~/.config/systemd/user/natgeo-wallpaper.timer
+## Directory Structure
+
+```
+~/Pictures/NationalGeographic/
+├── 01-02-2026/                          # Daily photos by date
+│   ├── Photo_Title.jpg
+│   └── Photo_Title.log
+├── 02-02-2026/
+│   └── Another_Photo.jpg
+└── collections/                         # Monthly collections
+    ├── best-photos-october-2018/
+    │   ├── 01-best-pod-october-18.jpg
+    │   ├── 02-best-pod-october-18.jpg
+    │   └── collection.log
+    └── best-photos-september-2018/
+        └── ...
 ```
 
-Then reload:
+## Supported Desktop Environments
+
+| Environment | Tool Used | Multi-Monitor | Virtual Desktops |
+|-------------|-----------|---------------|------------------|
+| KDE Plasma 6 | qdbus6 | Yes | Yes |
+| KDE Plasma 5 | qdbus | Yes | No |
+| GNOME | gsettings | No | No |
+| X11 | feh | No | No |
+
+## Examples
+
+### Build a Photo Collection and Rotate Hourly
+
 ```bash
-systemctl --user daemon-reload
-systemctl --user restart natgeo-wallpaper.timer
+# Download some collections
+natgeo-wallpapers download-collection --url "https://www.nationalgeographic.com/photography/article/best-photos-october-2018"
+natgeo-wallpapers download-collection --url "https://www.nationalgeographic.com/photography/article/best-photos-september-2018"
+
+# Set up hourly random rotation
+natgeo-wallpapers install --time 1h --random --path ~/Pictures/NationalGeographic/collections
 ```
 
-## Setting Wallpaper
-
-The `set_wallpaper.sh` script downloads today's photo and sets wallpapers with multi-monitor support.
-
-### Usage
+### Daily Photo with Manual Rotation
 
 ```bash
-# Default: different wallpaper per monitor
-./set_wallpaper.sh
+# Set up daily download at 2am (no --random, uses newest photo)
+natgeo-wallpapers install --time 02:00
 
-# Different wallpaper per monitor (explicit)
-./set_wallpaper.sh monitors
-
-# Different wallpaper per virtual desktop
-./set_wallpaper.sh virtual-desktops
-
-# Different wallpaper per monitor × virtual desktop
-./set_wallpaper.sh both
+# Manually set a random wallpaper anytime
+natgeo-wallpapers set --random
 ```
 
-### Supported Desktop Environments
+### Set Specific Photo
 
-- **KDE Plasma 6** - Uses `qdbus6` for full multi-monitor/VD support, or `plasma-apply-wallpaperimage` fallback
-- **KDE Plasma 5** - Uses `qdbus` (monitor mode only)
-- **GNOME/Ubuntu** - Uses `gsettings` 
-- **Generic X11** - Uses `feh`
-
-### Multi-Monitor/Virtual Desktop Modes
-
-**How it works:**
-- Downloads today's photo, then uses existing photos (newest first)
-- Monitor 1 = today's photo, Monitor 2/VD 2/etc = previous photos
-- Automatically detects your setup (monitors + virtual desktops)
-- Reuses photos if you don't have enough
-
-**Examples:**
-
-If you have 2 monitors and 2 virtual desktops:
-- `monitors` mode: 2 different photos (one per monitor)
-- `virtual-desktops` mode: 2 different photos (one per VD, same across both monitors)
-- `both` mode: 4 different photos (unique per monitor × VD combination)
-
-**Building photo collection:**
 ```bash
-# Run daily to collect more photos, then set wallpapers
-./set_wallpaper.sh both
+natgeo-wallpapers set --path ~/Pictures/NationalGeographic/collections/best-photos-october-2018/01-best-pod-october-18.jpg
 ```
 
-### Logs
+## Configuration
 
-The script logs to `~/.local/share/natgeo-wallpapers/wallpaper.log`
+Photos are saved to `~/Pictures/NationalGeographic/` by default. To change this, edit the constants in `src/lib.rs`:
 
-View logs:
-```bash
-tail -f ~/.local/share/natgeo-wallpapers/wallpaper.log
+```rust
+pub const PHOTO_SAVE_PATH: &str = "~/Pictures/NationalGeographic/";
+pub const COLLECTION_SAVE_PATH: &str = "~/Pictures/NationalGeographic/collections/";
 ```
-
-## How It Works
-
-1. The script fetches the National Geographic Photo of the Day webpage
-2. It parses the HTML to extract the Open Graph (og:image) meta tag containing the photo URL
-3. The photo title is extracted from the og:title meta tag
-4. The image is downloaded with proper browser headers to avoid blocking
-5. The file is saved with the sanitized title as the filename
 
 ## Troubleshooting
 
 ### 403 Forbidden Error
 
-If you encounter a 403 error, the script may need updated User-Agent headers. The script already includes modern browser headers, but these can be updated in the `get_current_web_natgeo_gallery()` and `download_natgeo_photo_of_the_day()` functions.
+The script uses browser-like headers to avoid blocking. If you still get 403 errors, the website structure may have changed.
 
-### Empty or Invalid Image URL
+### No Photos Found
 
-If the HTML structure of the National Geographic website changes, the parsing logic may need to be updated. The script looks for `property="og:image"` meta tags in the HTML.
+Make sure you've downloaded some photos first:
+
+```bash
+natgeo-wallpapers download
+# or
+natgeo-wallpapers download-collection --url <collection-url>
+```
 
 ### Check Logs
 
-Run the program with verbose output to see what's happening:
-
 ```bash
-RUST_LOG=debug cargo run
-```
+# View download logs
+cat ~/Pictures/NationalGeographic/*/Photo_Title.log
 
-## Project Structure
+# View wallpaper setting logs
+cat ~/.local/share/natgeo-wallpapers/wallpaper.log
 
-The project follows Rust conventions with separated unit and integration tests:
-
-```
-src/
-├── main.rs          # Entry point (72 lines)
-├── lib.rs           # Core logic + unit tests (343 lines)
-tests/
-└── integration.rs   # Integration tests (118 lines)
+# View systemd service logs
+journalctl --user -u natgeo-wallpaper.service --since today
 ```
 
 ## Development
 
-### Testing
-
-The project includes comprehensive unit and integration tests to ensure reliability.
-
-**Run all checks (recommended before committing):**
-```bash
-make check
-```
-
-This runs:
-- Code formatting check
-- Clippy linting
-- All tests
-
-### Test Coverage
-
-**Unit Tests (8 tests in `src/lib.rs`):**
-- ✅ File extension detection from MIME types (jpg, png, gif)
-- ✅ Content-type parsing with parameters
-- ✅ Log file creation and formatting with timestamps
-- ✅ Title sanitization (special characters: /, :, |)
-- ✅ Title length limiting (max 100 characters)
-- ✅ Date format validation (dd-mm-YYYY)
-- ✅ HTML parsing for og:image and og:title meta tags
-- ✅ Mock image file download and save
-
-**Integration Tests (4 tests in `tests/integration.rs`):**
-- ✅ Real network image download (via httpbin)
-- ✅ Log and photo file co-location verification
-- ✅ Error log creation and messages
-- ✅ Full workflow simulation (fetch → download → log)
-
 ### Running Tests
 
-**Run all checks:**
 ```bash
-make check      # Format check + linting + tests
+cargo test           # All tests
+cargo clippy         # Linting
+cargo fmt            # Format code
 ```
 
-**Run only tests:**
-```bash
-make test       # All tests
-cargo test --lib                    # Unit tests only
-cargo test --test integration       # Integration tests only
-cargo test test_download_real_image # Specific test
+### Project Structure
+
 ```
-
-**Run only linting:**
-```bash
-make lint       # Format check + clippy
+src/
+├── main.rs          # CLI and systemd setup
+└── lib.rs           # Core logic (download, scraping, wallpaper)
+tests/
+└── integration.rs   # Integration tests
+assets/
+├── service.template # (legacy, now generated dynamically)
+└── timer.template   # (legacy, now generated dynamically)
 ```
-
-**Full CI pipeline (format code + lint + test + build):**
-```bash
-make all
-```
-
-All tests use temporary directories (`tempfile` crate) for isolation and automatic cleanup.
-
-### Makefile Targets
-
-```bash
-make check     # Run formatting check, linting, and tests
-make test      # Run all tests
-make lint      # Run clippy and formatting check
-make install   # Build release binary and run install script
-make clean     # Clean build artifacts
-make all       # Format, lint, test, and build release
-```
-
-## Dependencies
-
-- `reqwest` - HTTP client with blocking API
-- `serde` - Serialization framework
-- `chrono` - Date and time handling
-- `thiserror` - Error handling
 
 ## Uninstall
 
-To remove the installation:
-
 ```bash
-# Remove binaries
-rm ~/.local/bin/natgeo-wallpapers
-rm ~/.local/bin/natgeo-set-wallpaper
+# Uninstall timer
+natgeo-wallpapers install --uninstall
 
-# Remove systemd timer
-systemctl --user stop natgeo-wallpaper.timer
-systemctl --user disable natgeo-wallpaper.timer
-rm ~/.config/systemd/user/natgeo-wallpaper.service
-rm ~/.config/systemd/user/natgeo-wallpaper.timer
-systemctl --user daemon-reload
+# Remove binary
+rm ~/.local/bin/natgeo-wallpapers
 
 # Remove wallpaper picker integration
 rm -rf ~/.local/share/wallpapers/NationalGeographic
@@ -374,5 +303,5 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 ## Notes
 
 - National Geographic's website structure may change over time, which could break the scraping logic
-- The old JSON API endpoint (`/content/photography/en_US/photo-of-the-day/_jcr_content/.gallery.<date>.json`) is no longer accessible due to CloudFront protection
-- This implementation uses HTML scraping as a workaround
+- The "Best of Photo of the Day" collections include photos from related months that appear on the page
+- Only one systemd timer can be active at a time; running `install` again replaces the previous configuration

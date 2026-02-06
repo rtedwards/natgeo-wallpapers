@@ -1,5 +1,6 @@
 use chrono::Local;
 use owo_colors::OwoColorize;
+use rand::seq::SliceRandom;
 use reqwest::blocking::Client;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, ACCEPT_LANGUAGE, USER_AGENT};
 use std::{
@@ -15,6 +16,7 @@ use thiserror::Error;
 // that scrapes the photo of the day page directly
 pub const NATGEO_POD_URL: &str = "https://www.nationalgeographic.com/photo-of-the-day";
 pub const PHOTO_SAVE_PATH: &str = "~/Pictures/NationalGeographic/"; // Photos saved here
+pub const COLLECTION_SAVE_PATH: &str = "~/Pictures/NationalGeographic/collections/"; // Collections saved here
 pub const LOG_DIR: &str = "~/.local/share/natgeo-wallpapers/";
 
 // Since the JSON API is now protected, we'll need to scrape the HTML page
@@ -23,6 +25,13 @@ pub const LOG_DIR: &str = "~/.local/share/natgeo-wallpapers/";
 pub struct PhotoInfo {
     pub image_url: String,
     pub title: String,
+}
+
+/// A collection of photos from a "Best of Photo of the Day" page
+#[derive(Debug)]
+pub struct PhotoCollection {
+    pub name: String,
+    pub photos: Vec<PhotoInfo>,
 }
 
 // Define a custom error type
@@ -256,6 +265,284 @@ pub fn download_natgeo_photo_of_the_day(
     Ok(())
 }
 
+// ============================================================================
+// Collection Scraping Functions
+// ============================================================================
+
+/// Extract the collection name from a URL like "best-photos-october-2018"
+pub fn extract_collection_name_from_url(url: &str) -> String {
+    url.split('/')
+        .next_back()
+        .unwrap_or("collection")
+        .to_string()
+}
+
+/// Create the HTTP client with browser-like headers
+fn create_http_client() -> Result<Client, PhotoError> {
+    let mut headers = HeaderMap::new();
+    headers.insert(USER_AGENT, HeaderValue::from_static("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/999.0.0.0 Safari/537.36"));
+    headers.insert(
+        ACCEPT,
+        HeaderValue::from_static(
+            "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        ),
+    );
+    headers.insert(ACCEPT_LANGUAGE, HeaderValue::from_static("en-US,en;q=0.9"));
+    headers.insert(
+        "Referer",
+        HeaderValue::from_static("https://www.nationalgeographic.com/"),
+    );
+
+    Client::builder()
+        .default_headers(headers)
+        .build()
+        .map_err(PhotoError::from)
+}
+
+/// Minimum file size in bytes to keep (skip small thumbnails/icons)
+const MIN_PHOTO_SIZE_BYTES: u64 = 50_000; // 50KB
+
+/// Check if a filename looks like a "Best of Photo of the Day" collection photo
+/// Matches patterns like: `01-best-pod-october-18`, `02_best-pod-july-18`, `best_pod_landscapes`
+fn is_collection_photo_filename(filename: &str) -> bool {
+    let lower = filename.to_lowercase();
+    lower.contains("best-pod") || lower.contains("best_pod")
+}
+
+/// Extract all unique image URLs from i.natgeofe.com in the HTML body
+fn extract_natgeo_image_urls(body: &str) -> Vec<String> {
+    let mut urls: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // Look for patterns like "https://i.natgeofe.com/n/UUID/filename.jpg"
+    // These appear in various contexts: img src, JSON data, meta tags
+    for part in body.split("https://i.natgeofe.com/n/") {
+        // Skip the first split (before first match)
+        if part.starts_with("i.natgeofe.com") {
+            continue;
+        }
+
+        // Extract the path until we hit a quote, space, or other delimiter
+        let path_end = part.find(['"', '\'', ' ', '?', '\\']).unwrap_or(part.len());
+
+        let path = &part[..path_end];
+
+        // Only include if it looks like a valid image path (has UUID and extension)
+        // We use to_lowercase() so the ends_with checks are already case-insensitive
+        let path_lower = path.to_lowercase();
+        #[allow(clippy::case_sensitive_file_extension_comparisons)]
+        let has_image_ext = path_lower.ends_with(".jpg")
+            || path_lower.ends_with(".png")
+            || path_lower.ends_with(".gif");
+        if path.contains('/') && has_image_ext {
+            // Skip crop variants (e.g., _16x9.jpg, _3x2.jpg) - we want the raw images
+            let is_crop_variant = path.contains("_16x9")
+                || path.contains("_3x2")
+                || path.contains("_4x3")
+                || path.contains("_2x1")
+                || path.contains("_2x3")
+                || path.contains("_3x4")
+                || path.contains("_square");
+
+            if !is_crop_variant {
+                let full_url = format!("https://i.natgeofe.com/n/{}", path);
+                if seen.insert(full_url.clone()) {
+                    urls.push(full_url);
+                }
+            }
+        }
+    }
+
+    urls
+}
+
+/// Fetch photos from a "Best of Photo of the Day" collection page
+pub fn get_collection_photos(url: &str) -> Result<PhotoCollection, PhotoError> {
+    let client = create_http_client()?;
+
+    let response = client.get(url).send()?;
+
+    let status = response.status();
+    if !status.is_success() {
+        return Err(PhotoError::InvalidContentType(format!(
+            "HTTP {}: Failed to fetch collection page",
+            status
+        )));
+    }
+
+    let body = response.text()?;
+
+    // Extract collection name from og:title or URL
+    let name = body
+        .split("property=\"og:title\"")
+        .nth(1)
+        .and_then(|s| s.split("content=\"").nth(1))
+        .and_then(|s| s.split('"').next())
+        .filter(|s| !s.is_empty() && s.len() >= 5)
+        .map_or_else(|| extract_collection_name_from_url(url), String::from);
+
+    // Extract all image URLs
+    let image_urls = extract_natgeo_image_urls(&body);
+
+    if image_urls.is_empty() {
+        return Err(PhotoError::NoPhotos(format!(
+            "No photos found in collection: {}",
+            url
+        )));
+    }
+
+    // Create PhotoInfo for each URL, using filename as title
+    // Filter to only include photos that match the "best-pod" naming pattern
+    let photos: Vec<PhotoInfo> = image_urls
+        .into_iter()
+        .filter_map(|image_url| {
+            let title = image_url
+                .split('/')
+                .next_back()
+                .and_then(|filename| filename.split('.').next())
+                .unwrap_or("photo")
+                .to_string();
+
+            // Only include photos matching the collection naming pattern
+            if is_collection_photo_filename(&title) {
+                Some(PhotoInfo { image_url, title })
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if photos.is_empty() {
+        return Err(PhotoError::NoPhotos(format!(
+            "No collection photos found (matching 'best-pod' pattern) in: {}",
+            url
+        )));
+    }
+
+    Ok(PhotoCollection { name, photos })
+}
+
+/// Download result for a collection
+#[derive(Debug)]
+pub struct CollectionDownloadResult {
+    pub downloaded: usize,
+    pub skipped: usize,
+    pub failed: usize,
+}
+
+/// Find a downloaded file by its sanitized title (checks jpg, png, gif extensions)
+fn find_downloaded_file(dir: &str, sanitized_title: &str) -> Option<std::path::PathBuf> {
+    for ext in ["jpg", "png", "gif"] {
+        let path = std::path::PathBuf::from(format!("{}/{}.{}", dir, sanitized_title, ext));
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// Download all photos from a collection
+pub fn download_collection(
+    collection: &PhotoCollection,
+    collection_name: &str,
+) -> Result<CollectionDownloadResult, PhotoError> {
+    let base_dir = expand_tilde(COLLECTION_SAVE_PATH);
+    let save_dir = format!("{}{}", base_dir, collection_name);
+
+    // Create the collection directory
+    std::fs::create_dir_all(&save_dir)?;
+
+    let log_path = format!("{}/collection.log", save_dir);
+    write_log(
+        &log_path,
+        &format!("Starting download of collection: {}", collection.name),
+    );
+    write_log(
+        &log_path,
+        &format!("Total photos: {}", collection.photos.len()),
+    );
+
+    let mut downloaded = 0;
+    let mut skipped = 0;
+    let mut failed = 0;
+
+    for photo in &collection.photos {
+        let sanitized_title = sanitize_title(&photo.title);
+
+        // Check if already exists
+        let already_exists = std::fs::read_dir(&save_dir).ok().is_some_and(|entries| {
+            entries.flatten().any(|entry| {
+                let path = entry.path();
+                path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|stem| stem == sanitized_title)
+                    && path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .is_some_and(|ext| matches!(ext, "jpg" | "png" | "gif"))
+            })
+        });
+
+        if already_exists {
+            skipped += 1;
+            continue;
+        }
+
+        match download_natgeo_photo_of_the_day(
+            &photo.image_url,
+            &save_dir,
+            &sanitized_title,
+            &log_path,
+        ) {
+            Ok(()) => {
+                // Check file size and remove if too small (likely a thumbnail)
+                let downloaded_file = find_downloaded_file(&save_dir, &sanitized_title);
+                if let Some(file_path) = downloaded_file {
+                    if let Ok(metadata) = std::fs::metadata(&file_path) {
+                        if metadata.len() < MIN_PHOTO_SIZE_BYTES {
+                            // Remove small file (thumbnail/icon)
+                            let _ = std::fs::remove_file(&file_path);
+                            write_log(
+                                &log_path,
+                                &format!(
+                                    "Removed {} (too small: {} bytes, min: {} bytes)",
+                                    sanitized_title,
+                                    metadata.len(),
+                                    MIN_PHOTO_SIZE_BYTES
+                                ),
+                            );
+                            skipped += 1;
+                            continue;
+                        }
+                    }
+                }
+                downloaded += 1;
+            }
+            Err(e) => {
+                write_log(
+                    &log_path,
+                    &format!("Failed to download {}: {}", photo.title, e),
+                );
+                failed += 1;
+            }
+        }
+    }
+
+    write_log(
+        &log_path,
+        &format!(
+            "Collection download complete: {} downloaded, {} skipped, {} failed",
+            downloaded, skipped, failed
+        ),
+    );
+
+    Ok(CollectionDownloadResult {
+        downloaded,
+        skipped,
+        failed,
+    })
+}
+
 // Helper function to sanitize title for filename
 pub fn sanitize_title(title: &str) -> String {
     title
@@ -386,27 +673,52 @@ fn collect_photos(dir: &std::path::Path, photos: &mut Vec<PathBuf>) -> io::Resul
 
 /// Find all photos in the photo directory, sorted newest first
 pub fn find_all_photos() -> Result<Vec<PathBuf>, PhotoError> {
-    let photo_dir = expand_tilde(PHOTO_SAVE_PATH);
-    let photo_path = std::path::Path::new(&photo_dir);
+    find_photos_in_path(None)
+}
 
-    if !photo_path.exists() {
+/// Find photos in a specific path (file or directory), or default location if None
+pub fn find_photos_in_path(path: Option<&str>) -> Result<Vec<PathBuf>, PhotoError> {
+    let search_path = match path {
+        Some(p) => expand_tilde(p),
+        None => expand_tilde(PHOTO_SAVE_PATH),
+    };
+
+    let search_path_obj = std::path::Path::new(&search_path);
+
+    if !search_path_obj.exists() {
         return Err(PhotoError::NoPhotos(format!(
-            "Photo directory not found: {}",
-            photo_dir
+            "Path not found: {}",
+            search_path
         )));
     }
 
     let mut photos: Vec<PathBuf> = Vec::new();
-    collect_photos(photo_path, &mut photos)?;
+
+    // If it's a single file, just use that
+    if search_path_obj.is_file() {
+        if let Some(ext) = search_path_obj.extension().and_then(|e| e.to_str()) {
+            if matches!(ext.to_lowercase().as_str(), "jpg" | "jpeg" | "png" | "gif") {
+                photos.push(search_path_obj.to_path_buf());
+            } else {
+                return Err(PhotoError::NoPhotos(format!(
+                    "Not a supported image file: {}",
+                    search_path
+                )));
+            }
+        }
+    } else {
+        // It's a directory, collect all photos recursively
+        collect_photos(search_path_obj, &mut photos)?;
+    }
 
     if photos.is_empty() {
         return Err(PhotoError::NoPhotos(format!(
             "No photos found in {}",
-            photo_dir
+            search_path
         )));
     }
 
-    // Sort by path (which includes date directories) in reverse order (newest first)
+    // Sort by path in reverse order (newest first)
     photos.sort();
     photos.reverse();
 
@@ -594,9 +906,26 @@ fn set_wallpaper_feh(photo_path: &std::path::Path) -> Result<(), PhotoError> {
     }
 }
 
-/// Main wallpaper setting function
-#[allow(clippy::too_many_lines)]
+/// Main wallpaper setting function (uses default photo directory)
 pub fn set_wallpapers(mode: WallpaperMode) -> Result<(), PhotoError> {
+    set_wallpapers_with_options(mode, None, false)
+}
+
+/// Main wallpaper setting function with optional custom path (for backwards compatibility)
+pub fn set_wallpapers_with_path(
+    mode: WallpaperMode,
+    path: Option<String>,
+) -> Result<(), PhotoError> {
+    set_wallpapers_with_options(mode, path, false)
+}
+
+/// Main wallpaper setting function with all options
+#[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
+pub fn set_wallpapers_with_options(
+    mode: WallpaperMode,
+    path: Option<String>,
+    random: bool,
+) -> Result<(), PhotoError> {
     let log_path = format!("{}wallpaper.log", expand_tilde(LOG_DIR));
 
     // Ensure log directory exists
@@ -612,8 +941,16 @@ pub fn set_wallpapers(mode: WallpaperMode) -> Result<(), PhotoError> {
         &format!("Starting wallpaper set with mode: {}", mode),
     );
 
-    // Find all photos
-    let photos = find_all_photos()?;
+    // Find photos (from custom path or default)
+    let mut photos = find_photos_in_path(path.as_deref())?;
+    if let Some(ref p) = path {
+        println!("{} Using path: {}", "✓".green(), p);
+    }
+    if random {
+        println!("{} Random selection enabled", "✓".green());
+        let mut rng = rand::thread_rng();
+        photos.shuffle(&mut rng);
+    }
     println!("{} Found {} photo(s)\n", "✓".green(), photos.len());
 
     // Detect desktop environment
@@ -1056,5 +1393,177 @@ mod tests {
         assert_eq!(expand_tilde("/absolute/path"), "/absolute/path");
         assert_eq!(expand_tilde("relative/path"), "relative/path");
         assert_eq!(expand_tilde("~notahome"), "~notahome");
+    }
+
+    // ========================================================================
+    // Collection Scraping Tests
+    // ========================================================================
+
+    #[test]
+    fn test_extract_collection_name_from_url() {
+        // Test various URL formats
+        assert_eq!(
+            extract_collection_name_from_url(
+                "https://www.nationalgeographic.com/photography/article/best-photos-october-2018"
+            ),
+            "best-photos-october-2018"
+        );
+        assert_eq!(
+            extract_collection_name_from_url(
+                "https://www.nationalgeographic.com/photography/article/best-photos-september-2018"
+            ),
+            "best-photos-september-2018"
+        );
+
+        // Edge case: URL with trailing slash
+        assert_eq!(
+            extract_collection_name_from_url("https://example.com/path/to/collection/"),
+            ""
+        );
+
+        // Edge case: simple path
+        assert_eq!(
+            extract_collection_name_from_url("collection-name"),
+            "collection-name"
+        );
+    }
+
+    #[test]
+    fn test_extract_natgeo_image_urls() {
+        // Test HTML with multiple image URLs
+        let html = r#"
+            <img src="https://i.natgeofe.com/n/abc123/photo1.jpg">
+            <img src="https://i.natgeofe.com/n/def456/photo2.jpg">
+            <script>{"url": "https://i.natgeofe.com/n/ghi789/photo3.jpg"}</script>
+        "#;
+
+        let urls = extract_natgeo_image_urls(html);
+        assert_eq!(urls.len(), 3);
+        assert!(urls.contains(&"https://i.natgeofe.com/n/abc123/photo1.jpg".to_string()));
+        assert!(urls.contains(&"https://i.natgeofe.com/n/def456/photo2.jpg".to_string()));
+        assert!(urls.contains(&"https://i.natgeofe.com/n/ghi789/photo3.jpg".to_string()));
+    }
+
+    #[test]
+    fn test_extract_natgeo_image_urls_filters_crops() {
+        // Test that crop variants are filtered out
+        let html = r#"
+            <img src="https://i.natgeofe.com/n/abc123/photo1.jpg">
+            <img src="https://i.natgeofe.com/n/abc123/photo1_16x9.jpg">
+            <img src="https://i.natgeofe.com/n/abc123/photo1_3x2.jpg">
+            <img src="https://i.natgeofe.com/n/abc123/photo1_square.jpg">
+        "#;
+
+        let urls = extract_natgeo_image_urls(html);
+        // Should only include the raw image, not crop variants
+        assert_eq!(urls.len(), 1);
+        assert!(urls.contains(&"https://i.natgeofe.com/n/abc123/photo1.jpg".to_string()));
+    }
+
+    #[test]
+    fn test_extract_natgeo_image_urls_deduplicates() {
+        // Test that duplicate URLs are deduplicated
+        let html = r#"
+            <img src="https://i.natgeofe.com/n/abc123/photo1.jpg">
+            <img src="https://i.natgeofe.com/n/abc123/photo1.jpg">
+            <img src="https://i.natgeofe.com/n/abc123/photo1.jpg">
+        "#;
+
+        let urls = extract_natgeo_image_urls(html);
+        assert_eq!(urls.len(), 1);
+    }
+
+    #[test]
+    fn test_extract_natgeo_image_urls_handles_query_params() {
+        // Test that URLs with query parameters are handled correctly
+        let html = r#"
+            <img src="https://i.natgeofe.com/n/abc123/photo1.jpg?w=1200">
+        "#;
+
+        let urls = extract_natgeo_image_urls(html);
+        assert_eq!(urls.len(), 1);
+        // Should strip query params
+        assert!(urls.contains(&"https://i.natgeofe.com/n/abc123/photo1.jpg".to_string()));
+    }
+
+    #[test]
+    fn test_photo_collection_struct() {
+        let collection = PhotoCollection {
+            name: "Best Photos - October 2018".to_string(),
+            photos: vec![
+                PhotoInfo {
+                    image_url: "https://example.com/photo1.jpg".to_string(),
+                    title: "Photo 1".to_string(),
+                },
+                PhotoInfo {
+                    image_url: "https://example.com/photo2.jpg".to_string(),
+                    title: "Photo 2".to_string(),
+                },
+            ],
+        };
+
+        assert_eq!(collection.name, "Best Photos - October 2018");
+        assert_eq!(collection.photos.len(), 2);
+        assert_eq!(collection.photos[0].title, "Photo 1");
+        assert_eq!(collection.photos[1].title, "Photo 2");
+    }
+
+    #[test]
+    fn test_collection_download_result_struct() {
+        let result = CollectionDownloadResult {
+            downloaded: 5,
+            skipped: 3,
+            failed: 1,
+        };
+
+        assert_eq!(result.downloaded, 5);
+        assert_eq!(result.skipped, 3);
+        assert_eq!(result.failed, 1);
+    }
+
+    #[test]
+    fn test_is_collection_photo_filename() {
+        // Should match "best-pod" patterns
+        assert!(is_collection_photo_filename("01-best-pod-october-18"));
+        assert!(is_collection_photo_filename("02-best-pod-september-18"));
+        assert!(is_collection_photo_filename("09-best-pod-july-18"));
+        assert!(is_collection_photo_filename("best_pod_landscapes"));
+        assert!(is_collection_photo_filename("01-best_pod-august-18"));
+
+        // Case insensitive
+        assert!(is_collection_photo_filename("01-BEST-POD-October-18"));
+        assert!(is_collection_photo_filename("BEST_POD_Landscapes"));
+
+        // Should NOT match other patterns
+        assert!(!is_collection_photo_filename("MossForest"));
+        assert!(!is_collection_photo_filename("GettyImages-109899052"));
+        assert!(!is_collection_photo_filename("disneyplus"));
+        assert!(!is_collection_photo_filename("kids"));
+        assert!(!is_collection_photo_filename("SPI-1162458"));
+    }
+
+    #[test]
+    fn test_find_downloaded_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir = temp_dir.path().to_str().unwrap();
+
+        // Create a test file
+        let test_file = temp_dir.path().join("test_photo.jpg");
+        fs::write(&test_file, "fake image data").unwrap();
+
+        // Should find the file
+        let found = find_downloaded_file(dir, "test_photo");
+        assert!(found.is_some());
+        assert_eq!(found.unwrap(), test_file);
+
+        // Should not find non-existent file
+        let not_found = find_downloaded_file(dir, "nonexistent");
+        assert!(not_found.is_none());
+    }
+
+    #[test]
+    fn test_min_photo_size_constant() {
+        // Verify the minimum size is reasonable (50KB)
+        assert_eq!(MIN_PHOTO_SIZE_BYTES, 50_000);
     }
 }
